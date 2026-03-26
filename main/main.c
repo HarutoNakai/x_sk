@@ -3,6 +3,8 @@
 #include <string.h> 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/event_groups.h" // 【NEW】イベントグループ用
 #include "esp_vfs_dev.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
@@ -12,31 +14,29 @@
 #include "esp_vfs_fat.h"
 #include <dirent.h>     
 #include <sys/stat.h>
-#include "freertos/queue.h"
 
-// --- 【NEW】Wi-Fiとネットワーク用のライブラリ ---
+// --- Wi-Fiとネットワーク用のライブラリ ---
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
 
-// --- 【NEW】TCP/IPとソケット通信用のライブラリ ---
+// --- TCP/IPとソケット通信用のライブラリ ---
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
-#include "esp_timer.h" // 往復の時間を測るストップウォッチ用
-
+#include "esp_timer.h"
 
 
 #define MAX_ARGS 10
 //キューの箱
 QueueHandle_t mailbox = NULL;
 
-// --- 【NEW】シェル自身に現在地を記憶させる変数 ---
+// --- シェル自身に現在地を記憶させる変数 ---
 char current_dir[256] = "/storage";
 
 
-// --- 【NEW】HARUTOS プロセス管理テーブル (xv6ライク) ---
+// --- HARUTOS プロセス管理テーブル (xv6ライク) ---
 #define MAX_PROCS 10
 
 typedef struct {
@@ -55,31 +55,41 @@ typedef struct {
 } command_t;
 
 
+// --- 【NEW】Wi-Fi接続状態管理用の変数 ---
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+static int s_retry_num = 0;
+#define MAX_RETRY 3
+
+
 // --- 【UPDATED】Wi-Fiの状態が変わった時に呼ばれる関数 ---
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        printf("\n[Wi-Fi] Starting...\n");
-        esp_wifi_connect();
+        // ここでは何もしない（ユーザーがYESと言ってから接続開始する）
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t* disconnected = (wifi_event_sta_disconnected_t*) event_data;
-        
-        printf("\n[Wi-Fi] Disconnected. Reason code: %d\n", disconnected->reason);
-        printf("[Wi-Fi] Waiting 3 seconds before reconnecting...\n");
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        
-        esp_wifi_connect(); 
-        printf("HARUTOS:%s$ ", current_dir);
-        fflush(stdout);
+        if (s_retry_num < MAX_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            printf("\n[Wi-Fi] Retrying connection... (%d/%d)\n", s_retry_num, MAX_RETRY);
+        } else {
+            // 3回失敗したら「失敗フラグ」を立ててメイン処理に知らせる
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         printf("\n[Wi-Fi] Connected! Got IP Address: " IPSTR "\n", IP2STR(&event->ip_info.ip));
-        printf("HARUTOS:%s$ ", current_dir);
-        fflush(stdout);
+        s_retry_num = 0;
+        // 接続成功フラグを立てる
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-// --- 【NEW】Wi-Fiモジュールを叩き起こす儀式 ---
-void wifi_init_sta(void) {
+// --- 【UPDATED】Wi-Fiの「初期設定だけ」を行う関数 ---
+void wifi_init_core(void) {
+    s_wifi_event_group = xEventGroupCreate();
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
@@ -108,15 +118,103 @@ void wifi_init_sta(void) {
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    printf("\n[Wi-Fi] ESP32-C6 MAC Address: %02x:%02x:%02x:%02x:%02x:%02x\n", 
+    printf("[Wi-Fi] ESP32-C6 MAC Address: %02x:%02x:%02x:%02x:%02x:%02x\n", 
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     
-    printf("[Wi-Fi] Starting connection to '%s'...\n", WIFI_SSID);
+    // ドライバを起動するだけ（まだ接続はしない）
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+// --- 【NEW】手動でWi-Fiに接続するコマンド ---
+void cmd_wifi_connect(int argc, char *argv[]) {
+    // 現在のWi-Fiステータスを取得
+    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+    
+    if (bits & WIFI_CONNECTED_BIT) {
+        printf("[Wi-Fi] Already connected to '%s'!\n", WIFI_SSID);
+        return;
+    }
 
-// --- 【UPDATED】本物のICMPパケット構造体（RFC 792） ---
+    printf("[Wi-Fi] Manual connection attempt to '%s'...\n", WIFI_SSID);
+    s_retry_num = 0; // リトライ回数をリセット
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    
+    // 接続処理のキック
+    esp_wifi_connect();
+
+    // 成功(CONNECTED)か失敗(FAIL)のフラグが立つまで待機
+    bits = xEventGroupWaitBits(s_wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        // ※IPアドレスの表示自体は裏側のイベントハンドラが行ってくれます
+        printf("[Wi-Fi] Manual connection SUCCESS!\n");
+    } else if (bits & WIFI_FAIL_BIT) {
+        printf("Error: [Wi-Fi] Manual connection FAILED after %d attempts.\n", MAX_RETRY);
+    }
+}
+
+// --- 【NEW】ユーザーにY/Nを聞く便利関数 ---
+bool ask_yes_no(const char* question) {
+    printf("%s [Y/n]: ", question);
+    fflush(stdout);
+    while (1) {
+        int c = getchar();
+        if (c != EOF) {
+            // y か Enter が押されたら YES
+            if (c == 'y' || c == 'Y' || c == '\n' || c == '\r') {
+                printf("Y\n");
+                return true;
+            } 
+            // n が押されたら NO
+            else if (c == 'n' || c == 'N') {
+                printf("N\n");
+                return false;
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// --- 【NEW】対話型のWi-Fi接続シーケンス ---
+void interactive_wifi_connect(void) {
+    if (!ask_yes_no("\nDo you want to connect to Wi-Fi?")) {
+        printf("[Wi-Fi] Skipped. Starting in OFFLINE mode.\n");
+        return;
+    }
+
+    while (1) {
+        printf("[Wi-Fi] Connecting to '%s'...\n", WIFI_SSID);
+        s_retry_num = 0;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        
+        // 接続開始指示
+        esp_wifi_connect();
+
+        // 成功か失敗（3回リトライ後）のどちらかの結果が出るまで待機
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                pdFALSE,
+                pdFALSE,
+                portMAX_DELAY);
+
+        if (bits & WIFI_CONNECTED_BIT) {
+            break; // 接続成功したらループを抜ける
+        } else if (bits & WIFI_FAIL_BIT) {
+            printf("\n[Wi-Fi] Failed to connect after %d attempts.\n", MAX_RETRY);
+            if (!ask_yes_no("Retry connection?")) {
+                printf("[Wi-Fi] Giving up. Starting in OFFLINE mode.\n");
+                break; // NOなら諦めてループを抜ける
+            }
+        }
+    }
+}
+
+
+// --- 本物のICMPパケット構造体（RFC 792） ---
 typedef struct {
     uint8_t type;       
     uint8_t code;       
@@ -147,8 +245,7 @@ uint16_t calculate_checksum(uint16_t *addr, int len) {
     return answer;
 }
 
-// --- 【NEW】HTTPクライアントコマンド ---
-// 使い方: http <hostname> <path>  (例: http example.com /)
+// --- HTTPクライアントコマンド ---
 void cmd_http(int argc, char *argv[]) {
     if (argc < 3) {
         printf("Usage: http <hostname> <path>\n");
@@ -159,7 +256,6 @@ void cmd_http(int argc, char *argv[]) {
     const char *hostname = argv[1];
     const char *path = argv[2];
 
-    // 1. DNSで名前解決（ホスト名からIPアドレスを取得）
     struct addrinfo hints;
     struct addrinfo *res;
     memset(&hints, 0, sizeof(hints));
@@ -173,13 +269,11 @@ void cmd_http(int argc, char *argv[]) {
         return;
     }
 
-    // IPアドレスを文字列にして表示（おまけ）
     struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
     char ip_str[128];
     inet_ntoa_r(addr->sin_addr, ip_str, sizeof(ip_str) - 1);
     printf("Connecting to %s (%s) port 80...\n", hostname, ip_str);
 
-    // 2. TCPソケットの作成
     int sock = socket(res->ai_family, res->ai_socktype, 0);
     if (sock < 0) {
         printf("Error: Failed to create socket.\n");
@@ -187,25 +281,21 @@ void cmd_http(int argc, char *argv[]) {
         return;
     }
 
-    // タイムアウト設定（データ受信で永遠にフリーズするのを防ぐ）
     struct timeval timeout;
     timeout.tv_sec = 5; 
     timeout.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    // 3. サーバーにTCP接続
     if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
         printf("Error: Connection failed.\n");
         close(sock);
         freeaddrinfo(res);
         return;
     }
-    freeaddrinfo(res); // 接続できたらDNSの結果はもう不要なので解放
+    freeaddrinfo(res); 
 
     printf("Connected! Sending HTTP GET request...\n");
 
-    // 4. HTTP GETリクエストを組み立てて送信
-    // ★ちゃっかりUser-AgentをHARUTOSに偽装（？）しておく
     char request[256];
     snprintf(request, sizeof(request), 
              "GET %s HTTP/1.1\r\n"
@@ -220,25 +310,22 @@ void cmd_http(int argc, char *argv[]) {
         return;
     }
 
-    // 5. サーバーからの返事（HTMLテキスト）を受信して画面に出す
     char rx_buffer[128];
     int len;
     printf("\n--- HTTP RESPONSE ---\n");
     do {
-        // 土管からデータが来る限り読み続ける
         len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
         if (len > 0) {
-            rx_buffer[len] = '\0'; // 文字列の終端を入れる
+            rx_buffer[len] = '\0'; 
             printf("%s", rx_buffer);
         }
     } while (len > 0);
     printf("\n---------------------\n");
 
-    // 6. お片付け
     close(sock);
 }
 
-// --- 【UPDATED】ガチのPingコマンド ---
+// --- ガチのPingコマンド ---
 void cmd_ping(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: ping <IP Address>\n");
@@ -389,7 +476,7 @@ void cmd_mkdir(int argc, char *argv[]) {
     else printf("Error: Failed to create directory\n");
 }
 
-// --- 【UPDATED】バックグラウンドプロセス（受信側 / xv6自決対応） ---
+// --- バックグラウンドプロセス（受信側 / xv6自決対応） ---
 void background_task(void *pvParameters) {
     int p_index = (int)pvParameters; 
     int pid = proc_table[p_index].pid;
@@ -400,7 +487,6 @@ void background_task(void *pvParameters) {
     fflush(stdout);
 
     while (1) {
-        // ★ xv6スタイル：ループのたびに「死の宣告」がされていないかチェック！
         if (proc_table[p_index].killed) {
             printf("\n[Process %d] Killed flag detected. Cleaning up and exiting gracefully...\n", pid);
             proc_table[p_index].is_active = 0; 
@@ -425,7 +511,7 @@ void background_task(void *pvParameters) {
     }
 }
 
-// --- 【UPDATED】プロセス生成（プロセステーブルへの登録機能追加） ---
+// --- プロセス生成（プロセステーブルへの登録機能追加） ---
 void cmd_spawn(int argc, char *argv[]) {
     static int next_pid = 100;
     
@@ -455,7 +541,7 @@ void cmd_spawn(int argc, char *argv[]) {
     next_pid++;
 }
 
-// --- 【NEW】xv6スタイルの Kill コマンド ---
+// --- xv6スタイルの Kill コマンド ---
 void cmd_kill(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: kill <PID>\n");
@@ -467,11 +553,9 @@ void cmd_kill(int argc, char *argv[]) {
     for (int i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].is_active && proc_table[i].pid == target_pid) {
             
-            // 1. xv6スタイル：即死させるのではなく「死の宣告」フラグを立てる
             proc_table[i].killed = 1;
             printf("Kill signal sent to Process %d.\n", target_pid);
 
-            // 2. xv6スタイル：もし相手が通信待ちなどで冬眠していたら強制的に起床させる
             xTaskAbortDelay(proc_table[i].handle);
             
             return;
@@ -480,7 +564,7 @@ void cmd_kill(int argc, char *argv[]) {
     printf("Error: PID %d not found.\n", target_pid);
 }
 
-// --- 【NEW】プロセス間通信の送信コマンド ---
+// --- プロセス間通信の送信コマンド ---
 void cmd_send(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: send <message>\n");
@@ -505,7 +589,7 @@ void cmd_send(int argc, char *argv[]) {
 }
 
 
-// --- 【NEW】IPC（プロセス間通信）の監視コマンド ---
+// --- IPC（プロセス間通信）の監視コマンド ---
 void cmd_ipcs(int argc, char *argv[]) {
     if (mailbox == NULL) {
         printf("IPC Mailbox is not created yet.\n");
@@ -529,7 +613,7 @@ void cmd_ipcs(int argc, char *argv[]) {
 }
 
 
-// --- 【NEW】プロセス一覧表示コマンド ---
+// --- プロセス一覧表示コマンド ---
 void cmd_ps(int argc, char *argv[]) {
     printf("%-16s %-7s %-7s %-7s\n", "NAME", "STATE", "PRIO", "STACK");
     printf("--------------------------------------------\n");
@@ -621,7 +705,8 @@ command_t commands[] = {
     {"send",  "Send IPC message",        cmd_send},
     {"ipcs",  "Show IPC status",         cmd_ipcs},
     {"kill",  "Kill a process",          cmd_kill},
-    {"http",  "Send HTTP GET request",   cmd_http}
+    {"http",  "Send HTTP GET request",   cmd_http},
+    {"wifi_connect", "Connect to Wi-Fi", cmd_wifi_connect}
 };
 
 #define NUM_COMMANDS (sizeof(commands) / sizeof(command_t))
@@ -669,13 +754,13 @@ void app_main(void)
     printf(" |_|  |_/_/    \\_\\_|  \\_\\\\____/   |_|  \\____/|_____/ \n");
     printf("\n");
     printf("--- Welcome to HARUTOS v0.7 (Microkernel with IPC) ---\n");
-    printf("\n");
     
-    printf("HARUTOS:%s$ ", current_dir);
-    fflush(stdout);
-    printf("\n");
+    // 【NEW】ブート時のWi-Fi対話処理
+    wifi_init_core();
+    interactive_wifi_connect();
 
-    wifi_init_sta();
+    printf("\nHARUTOS:%s$ ", current_dir);
+    fflush(stdout);
 
     while (1) {
         int c = getchar();
