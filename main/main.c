@@ -809,6 +809,44 @@ void app_main(void)
                     fflush(stdout);
                 }
             }
+            else if (c == '\t') {
+                if (rx_pos > 0) {
+                    rx_buffer[rx_pos] = '\0'; // 一旦文字列として終端する
+                    int match_count = 0;
+                    int last_match_index = -1;
+
+                    // コマンド一覧から前方一致するものを探す
+                    for (int i = 0; i < NUM_COMMANDS; i++) {
+                        if (strncmp(rx_buffer, commands[i].name, rx_pos) == 0) {
+                            match_count++;
+                            last_match_index = i;
+                        }
+                    }
+
+                    if (match_count == 1) {
+                        // 候補が1つだけなら残りの文字を自動補完！
+                        const char* match_name = commands[last_match_index].name;
+                        int remaining_len = strlen(match_name) - rx_pos;
+                        
+                        printf("%s", match_name + rx_pos); // 残りを画面に出力
+                        fflush(stdout);
+                        
+                        strcpy(rx_buffer + rx_pos, match_name + rx_pos); // バッファにも追加
+                        rx_pos += remaining_len;
+                    } 
+                    else if (match_count > 1) {
+                        // 候補が複数ある場合はbashのように一覧を表示する
+                        printf("\n");
+                        for (int i = 0; i < NUM_COMMANDS; i++) {
+                            if (strncmp(rx_buffer, commands[i].name, rx_pos) == 0) {
+                                printf("%s  ", commands[i].name);
+                            }
+                        }
+                        printf("\nHARUTOS:%s$ %s", current_dir, rx_buffer);
+                        fflush(stdout);
+                    }
+                }
+            }
             else {
                 if (rx_pos < sizeof(rx_buffer) - 1) {
                     putchar(c); 
