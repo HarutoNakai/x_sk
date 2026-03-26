@@ -9,6 +9,8 @@
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 #include "secrets.h"
+#include "esp_log.h" // 【NEW】ログレベル制御用
+
 
 // --- 本格的なファイルシステム用のライブラリ ---
 #include "esp_vfs_fat.h"
@@ -721,6 +723,8 @@ void cmd_help(int argc, char *argv[]) {
 
 void app_main(void)
 {
+    // 【NEW】ESP-IDFのシステムログ（I や W）をすべて黙らせる（エラーのみ許可）
+    esp_log_level_set("*", ESP_LOG_ERROR);
     usb_serial_jtag_driver_config_t usb_config = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     usb_serial_jtag_driver_install(&usb_config);
     usb_serial_jtag_vfs_use_driver();
