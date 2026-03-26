@@ -1,0 +1,15 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.currentSetup": "C:\\Users\\81802\\esp\\esp-idf",
+  "idf.portWin": "COM3",
+  "idf.openOcdConfigs": [
+    "board/esp32c6-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "OPENOCD_SCRIPTS": "C:\\Users\\81802\\.espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20251215/openocd-esp32/share/openocd/scripts",
+    "IDF_CCACHE_ENABLE": "1",
+    "ESP_ROM_ELF_DIR": "C:\\Users\\81802\\.espressif\\tools\\esp-rom-elfs\\20241011/",
+    "IDF_TARGET": "esp32c6"
+  },
+  "idf.flashType": "UART"
+}
