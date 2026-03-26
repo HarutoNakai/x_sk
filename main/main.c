@@ -26,9 +26,7 @@
 #include "lwip/netdb.h"
 #include "esp_timer.h" // 往復の時間を測るストップウォッチ用
 
-// --- ご自宅のWi-Fi設定 ---
-#define WIFI_SSID "------"
-#define WIFI_PASS "------"
+
 
 #define MAX_ARGS 10
 //キューの箱
